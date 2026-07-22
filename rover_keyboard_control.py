@@ -1,277 +1,201 @@
-/*
-  =====================================================================
-  ROVER WIFI REMOTE CONTROL - ESP32 + OSOYOO Model Y Motor Driver
-  =====================================================================
+"""
+=====================================================================
+ROVER REMOTE CONTROL - Python script for your Dell laptop
+=====================================================================
+"""
 
-  WHAT THIS CODE DOES:
-  1. Connects your ESP32 to your home WiFi network ("Bluesky")
-  2. Starts a tiny "server" that listens for commands over WiFi
-  3. When a command arrives (like "forward" or "turn left"), it spins
-     the correct wheels in the correct direction
-  4. Tracks total distance traveled using the two back-wheel encoders,
-     and sends that distance back to your laptop over WiFi
+import socket
+import select
+import time
+from datetime import datetime
+import tkinter as tk
+from tkinter import messagebox
+from pynput import keyboard
 
-  HOW THE MOTOR DRIVER WORKS (from the OSOYOO Model Y datasheet):
-  - The board has 2 "channels": Channel A and Channel B
-  - Each channel controls 2 wheels *together* using one set of pins:
-      - IN1/IN2 pins  -> which direction wheel pair #1 on that channel spins
-      - IN3/IN4 pins  -> which direction wheel pair #2 on that channel spins
-      - ENA pin (PWM) -> how FAST wheel pair #1 spins (0-255)
-      - ENB pin (PWM) -> how FAST wheel pair #2 spins (0-255)
+ROVER_IP = "192.168.1.104"
+ROVER_PORT = 8888
+SEND_RATE_HZ = 10
+LOG_FILE_NAME = "rover_log.txt"
+SPEED_NAMES = {'1': 'SLOW', '2': 'MEDIUM', '3': 'FAST'}
+current_speed_label = "MEDIUM"
+sock = None
 
-  YOUR SPECIFIC WIRING:
-      FRONT LEFT wheel  (socket BK4) -> Channel B, IN3/IN4 + ENB
-      FRONT RIGHT wheel (socket BK2) -> Channel B, IN1/IN2 + ENA
-      BACK LEFT wheel   (socket AK4) -> Channel A, IN3/IN4 + ENB
-      BACK RIGHT wheel  (socket AK2) -> Channel A, IN1/IN2 + ENA
-  =====================================================================
-*/
+incoming_buffer = ""
+current_distance_mm = 0.0
+last_logged_distance_mm = 0.0
 
-#include <WiFi.h>
+_popup_root = tk.Tk()
+_popup_root.withdraw()
 
-const char* WIFI_SSID     = "Bluesky";
-const char* WIFI_PASSWORD = "Internet123$";
 
-const int SERVER_PORT = 8888;
-WiFiServer server(SERVER_PORT);
-WiFiClient client;
+def log_message(text):
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    full_line = f"[{timestamp}] {text}"
+    print(full_line)
+    with open(LOG_FILE_NAME, "a") as log_file:
+        log_file.write(full_line + "\n")
 
-// ---- FRONT LEFT wheel (plugged into socket BK4) ----
-#define FL_IN3   25
-#define FL_IN4   33
-#define FL_PWM   13
 
-// ---- FRONT RIGHT wheel (plugged into socket BK2) ----
-#define FR_IN1   27
-#define FR_IN2   26
-#define FR_PWM   32
+def show_error_popup(title, message):
+    log_message(f"ERROR - {title}: {message}")
+    messagebox.showerror(title, message)
 
-// ---- BACK LEFT wheel (plugged into socket AK4) ----
-#define BL_IN3   18
-#define BL_IN4   5
-#define BL_PWM   22
 
-// ---- BACK RIGHT wheel (plugged into socket AK2) ----
-#define BR_IN1   21
-#define BR_IN2   19
-#define BR_PWM   23
+def check_for_distance_updates():
+    global incoming_buffer, current_distance_mm, last_logged_distance_mm
 
-// ============================= ENCODER CONFIGURATION =============================
-#define ENCODER_BL 34
-#define ENCODER_BR 35
+    readable, _, _ = select.select([sock], [], [], 0)
+    if sock not in readable:
+        return True
 
-const float PULSES_PER_REV_BL = 615.0;
-const float PULSES_PER_REV_BR = 623.1;
+    try:
+        chunk = sock.recv(4096)
+    except Exception as e:
+        show_error_popup("Lost connection to rover", f"Could not read data.\n\nError detail: {e}")
+        return False
 
-const float WHEEL_DIAMETER_MM = 70.0;
-const float WHEEL_CIRCUMFERENCE_MM = WHEEL_DIAMETER_MM * PI;
+    if not chunk:
+        show_error_popup("Lost connection to rover", "The rover closed the connection unexpectedly.")
+        return False
 
-const float MM_PER_PULSE_BL = WHEEL_CIRCUMFERENCE_MM / PULSES_PER_REV_BL;
-const float MM_PER_PULSE_BR = WHEEL_CIRCUMFERENCE_MM / PULSES_PER_REV_BR;
+    incoming_buffer += chunk.decode(errors="ignore")
 
-volatile unsigned long pulseCountBL = 0;
-volatile unsigned long pulseCountBR = 0;
+    while "\n" in incoming_buffer:
+        line, incoming_buffer = incoming_buffer.split("\n", 1)
+        line = line.strip()
+        if line.startswith("DIST:"):
+            try:
+                current_distance_mm = float(line[5:])
+            except ValueError:
+                pass
+            if abs(current_distance_mm - last_logged_distance_mm) >= 10:
+                distance_cm = current_distance_mm / 10.0
+                log_message(f"Distance traveled: {distance_cm:.1f} cm")
+                last_logged_distance_mm = current_distance_mm
 
-unsigned long lastPulseCountBL = 0;
-unsigned long lastPulseCountBR = 0;
+    return True
 
-int directionBL = 0;
-int directionBR = 0;
 
-float totalDistanceMM = 0.0;
+pressed_keys = set()
+should_quit = False
 
-unsigned long lastDistanceSendTime = 0;
-const unsigned long DISTANCE_SEND_INTERVAL_MS = 200;
 
-void IRAM_ATTR onPulseBL() { pulseCountBL++; }
-void IRAM_ATTR onPulseBR() { pulseCountBR++; }
+def on_key_press(key):
+    global should_quit
+    if key == keyboard.Key.esc:
+        should_quit = True
+        return False
+    if key in (keyboard.Key.up, keyboard.Key.down, keyboard.Key.left, keyboard.Key.right):
+        pressed_keys.add(key)
+        log_message(f"Key pressed: {key_name(key)}")
+        return
+    if hasattr(key, "char") and key.char in SPEED_NAMES:
+        set_speed(key.char)
 
-const int SPEED_SLOW   = 90;
-const int SPEED_MEDIUM = 150;
-const int SPEED_FAST   = 255;
-int DRIVE_SPEED = SPEED_MEDIUM;
 
-const unsigned long COMMAND_TIMEOUT_MS = 500;
-unsigned long lastCommandTime = 0;
+def set_speed(number_key):
+    global current_speed_label
+    current_speed_label = SPEED_NAMES[number_key]
+    log_message(f"Speed set to: {current_speed_label}")
+    try:
+        sock.sendall(number_key.encode())
+    except Exception as e:
+        show_error_popup("Lost connection to rover", f"Could not send speed command.\n\nError detail: {e}")
 
-void frontLeft(int speed, bool forward) {
-  digitalWrite(FL_IN3, forward ? HIGH : LOW);
-  digitalWrite(FL_IN4, forward ? LOW  : HIGH);
-  analogWrite(FL_PWM, speed);
-}
 
-void frontRight(int speed, bool forward) {
-  digitalWrite(FR_IN1, forward ? HIGH : LOW);
-  digitalWrite(FR_IN2, forward ? LOW  : HIGH);
-  analogWrite(FR_PWM, speed);
-}
+def on_key_release(key):
+    if key in pressed_keys:
+        pressed_keys.discard(key)
+        log_message(f"Key released: {key_name(key)}")
 
-void backLeft(int speed, bool forward) {
-  digitalWrite(BL_IN3, forward ? HIGH : LOW);
-  digitalWrite(BL_IN4, forward ? LOW  : HIGH);
-  analogWrite(BL_PWM, speed);
-  directionBL = (speed == 0) ? 0 : (forward ? 1 : -1);
-}
 
-void backRight(int speed, bool forward) {
-  digitalWrite(BR_IN1, forward ? HIGH : LOW);
-  digitalWrite(BR_IN2, forward ? LOW  : HIGH);
-  analogWrite(BR_PWM, speed);
-  directionBR = (speed == 0) ? 0 : (forward ? 1 : -1);
-}
-
-void moveForward() {
-  frontLeft(DRIVE_SPEED, true);
-  frontRight(DRIVE_SPEED, true);
-  backLeft(DRIVE_SPEED, true);
-  backRight(DRIVE_SPEED, true);
-}
-
-void moveBackward() {
-  frontLeft(DRIVE_SPEED, false);
-  frontRight(DRIVE_SPEED, false);
-  backLeft(DRIVE_SPEED, false);
-  backRight(DRIVE_SPEED, false);
-}
-
-void turnLeft() {
-  frontLeft(DRIVE_SPEED, false);
-  backLeft(DRIVE_SPEED, false);
-  frontRight(DRIVE_SPEED, true);
-  backRight(DRIVE_SPEED, true);
-}
-
-void turnRight() {
-  frontLeft(DRIVE_SPEED, true);
-  backLeft(DRIVE_SPEED, true);
-  frontRight(DRIVE_SPEED, false);
-  backRight(DRIVE_SPEED, false);
-}
-
-void stopAllMotors() {
-  analogWrite(FL_PWM, 0);
-  analogWrite(FR_PWM, 0);
-  analogWrite(BL_PWM, 0);
-  analogWrite(BR_PWM, 0);
-  directionBL = 0;
-  directionBR = 0;
-}
-
-void setup() {
-  Serial.begin(115200);
-  delay(500);
-
-  pinMode(FL_IN3, OUTPUT); pinMode(FL_IN4, OUTPUT); pinMode(FL_PWM, OUTPUT);
-  pinMode(FR_IN1, OUTPUT); pinMode(FR_IN2, OUTPUT); pinMode(FR_PWM, OUTPUT);
-  pinMode(BL_IN3, OUTPUT); pinMode(BL_IN4, OUTPUT); pinMode(BL_PWM, OUTPUT);
-  pinMode(BR_IN1, OUTPUT); pinMode(BR_IN2, OUTPUT); pinMode(BR_PWM, OUTPUT);
-
-  stopAllMotors();
-
-  pinMode(ENCODER_BL, INPUT);
-  pinMode(ENCODER_BR, INPUT);
-  attachInterrupt(digitalPinToInterrupt(ENCODER_BL), onPulseBL, RISING);
-  attachInterrupt(digitalPinToInterrupt(ENCODER_BR), onPulseBR, RISING);
-
-  Serial.print("Connecting to WiFi network: ");
-  Serial.println(WIFI_SSID);
-
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-
-  Serial.println();
-  Serial.println("WiFi connected!");
-  Serial.print("ROVER IP ADDRESS: ");
-  Serial.println(WiFi.localIP());
-  Serial.println("Type this IP into your Python script on the laptop.");
-
-  server.begin();
-  Serial.println("Server started. Waiting for laptop to connect...");
-}
-
-void loop() {
-
-  if (!client || !client.connected()) {
-    client = server.available();
-    if (client) {
-      Serial.println("Laptop connected!");
-      lastCommandTime = millis();
+def key_name(key):
+    names = {
+        keyboard.Key.up: "UP", keyboard.Key.down: "DOWN",
+        keyboard.Key.left: "LEFT", keyboard.Key.right: "RIGHT",
     }
-  }
+    return names.get(key, str(key))
 
-  if (client && client.connected() && client.available()) {
-    char command = client.read();
-    lastCommandTime = millis();
 
-    switch (command) {
-      case 'F':
-        moveForward();
-        break;
-      case 'B':
-        moveBackward();
-        break;
-      case 'L':
-        turnLeft();
-        break;
-      case 'R':
-        turnRight();
-        break;
-      case 'S':
-        stopAllMotors();
-        break;
-      case '1':
-        DRIVE_SPEED = SPEED_SLOW;
-        Serial.println("Speed set to SLOW");
-        break;
-      case '2':
-        DRIVE_SPEED = SPEED_MEDIUM;
-        Serial.println("Speed set to MEDIUM");
-        break;
-      case '3':
-        DRIVE_SPEED = SPEED_FAST;
-        Serial.println("Speed set to FAST");
-        break;
-      default:
-        break;
-    }
-  }
+def decide_command():
+    if keyboard.Key.up in pressed_keys:
+        return 'F'
+    elif keyboard.Key.down in pressed_keys:
+        return 'B'
+    elif keyboard.Key.left in pressed_keys:
+        return 'L'
+    elif keyboard.Key.right in pressed_keys:
+        return 'R'
+    else:
+        return 'S'
 
-  if (millis() - lastCommandTime > COMMAND_TIMEOUT_MS) {
-    stopAllMotors();
-  }
 
-  unsigned long currentBL = pulseCountBL;
-  unsigned long newPulsesBL = currentBL - lastPulseCountBL;
-  lastPulseCountBL = currentBL;
-  float distanceThisStepBL = newPulsesBL * MM_PER_PULSE_BL * directionBL;
+def main():
+    global sock
+    log_message("=" * 50)
+    log_message("ROVER REMOTE CONTROL - session started")
+    log_message("=" * 50)
+    log_message(f"Connecting to rover at {ROVER_IP}:{ROVER_PORT} ...")
 
-  unsigned long currentBR = pulseCountBR;
-  unsigned long newPulsesBR = currentBR - lastPulseCountBR;
-  lastPulseCountBR = currentBR;
-  float distanceThisStepBR = newPulsesBR * MM_PER_PULSE_BR * directionBR;
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.connect((ROVER_IP, ROVER_PORT))
+    except Exception as e:
+        show_error_popup(
+            "Could not connect to rover",
+            f"Things to check:\n1. Is the rover powered on?\n2. Correct IP address?\n3. Same WiFi?\n\nError detail: {e}"
+        )
+        return
 
-  totalDistanceMM += (distanceThisStepBL + distanceThisStepBR) / 2.0;
+    log_message("Connected to rover!")
+    print("\nControls:")
+    print("  Up arrow    = Forward")
+    print("  Down arrow  = Backward")
+    print("  Left arrow  = Turn left")
+    print("  Right arrow = Turn right")
+    print("  1 / 2 / 3   = Speed: Slow / Medium / Fast")
+    print("  ESC         = Quit\n")
+    print("Distance traveled will be logged automatically as you drive.")
+    print("Click this window to make sure it's active, then drive!")
 
-  // ---- TEMPORARY DEBUG OUTPUT ----
-  static unsigned long lastDebugPrint = 0;
-  if (millis() - lastDebugPrint > 1000) {
-    lastDebugPrint = millis();
-    Serial.print("[DEBUG] Raw pulses - BL: ");
-    Serial.print(pulseCountBL);
-    Serial.print("  BR: ");
-    Serial.print(pulseCountBR);
-    Serial.print("   Total distance (mm): ");
-    Serial.println(totalDistanceMM);
-  }
+    listener = keyboard.Listener(on_press=on_key_press, on_release=on_key_release)
+    listener.start()
 
-  if (client && client.connected() &&
-      millis() - lastDistanceSendTime > DISTANCE_SEND_INTERVAL_MS) {
-    lastDistanceSendTime = millis();
-    client.print("DIST:");
-    client.println(totalDistanceMM, 1);
-  }
-}
+    last_command_sent = None
+
+    try:
+        while not should_quit:
+            command = decide_command()
+            if command != last_command_sent:
+                labels = {'F': 'FORWARD', 'B': 'BACKWARD', 'L': 'TURN LEFT', 'R': 'TURN RIGHT', 'S': 'STOP'}
+                log_message(f"Rover action: {labels[command]} (speed: {current_speed_label})")
+                last_command_sent = command
+
+            try:
+                sock.sendall(command.encode())
+            except Exception as e:
+                show_error_popup("Lost connection to rover", f"Connection dropped.\n\nError detail: {e}")
+                break
+
+            time.sleep(1.0 / SEND_RATE_HZ)
+
+            if not check_for_distance_updates():
+                break
+
+    except KeyboardInterrupt:
+        pass
+
+    finally:
+        try:
+            sock.sendall('S'.encode())
+        except Exception:
+            pass
+        sock.close()
+        listener.stop()
+        log_message(f"Final distance traveled: {current_distance_mm / 10.0:.1f} cm")
+        log_message("Disconnected. Rover stopped. Session ended.")
+        _popup_root.destroy()
+
+
+if __name__ == "__main__":
+    main()
